@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>歐拉角互動演示器 - 簡報專用</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        body { 
+            margin: 0; 
+            background-color: #0f172a; 
+            color: #f8fafc; 
+            font-family: 'Inter', sans-serif; 
+            overflow: hidden; 
+        }
+        canvas { display: block; }
+        .slider-label { display: flex; justify-content: space-between; margin-bottom: 0.25rem; font-size: 0.875rem; font-weight: 600; }
+        input[type=range] { 
+            width: 100%; 
+            cursor: pointer; 
+            accent-color: #22d3ee;
+            background: #1e293b;
+            height: 6px;
+            border-radius: 3px;
+        }
+        .matrix-cell { 
+            width: 65px; 
+            text-align: center; 
+            padding: 6px; 
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid #334155; 
+            font-family: 'Courier New', monospace; 
+            font-size: 0.85rem; 
+            color: #22d3ee;
+            border-radius: 4px;
+        }
+        .control-panel {
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="absolute top-6 left-6 z-10 w-80 control-panel p-6 rounded-2xl shadow-2xl">
+        <h1 class="text-xl font-bold text-white mb-1">歐拉角旋轉演示</h1>
+        <p class="text-xs text-slate-400 mb-6 font-medium">旋轉順序: Z-Y-X (Yaw-Pitch-Roll)</p>
+        
+        <div class="space-y-6">
+            <div>
+                <div class="slider-label">
+                    <span class="text-red-400">Roll (X-Axis): <span id="val-roll">0</span>°</span>
+                </div>
+                <input type="range" id="roll" min="-180" max="180" value="0" step="1">
+            </div>
+            
+            <div>
+                <div class="slider-label">
+                    <span class="text-green-400">Pitch (Y-Axis): <span id="val-pitch">0</span>°</span>
+                </div>
+                <input type="range" id="pitch" min="-90" max="90" value="0" step="1">
+            </div>
+            
+            <div>
+                <div class="slider-label">
+                    <span class="text-blue-400">Yaw (Z-Axis): <span id="val-yaw">0</span>°</span>
+                </div>
+                <input type="range" id="yaw" min="-180" max="180" value="0" step="1">
+            </div>
+        </div>
+
+        <div id="gimbal-warning" class="hidden mt-6 p-3 bg-red-900/30 border border-red-500/50 rounded-lg text-red-200 text-xs animate-pulse text-center">
+            ⚠️ 偵測到萬向節死鎖 (Gimbal Lock)
+        </div>
+
+        <div class="mt-8">
+            <h2 class="text-xs font-bold text-slate-500 mb-3 uppercase tracking-widest">旋轉矩陣 Rotation Matrix</h2>
+            <div id="matrix-display" class="grid grid-cols-3 gap-1.5"></div>
+        </div>
+
+        <button id="reset" class="mt-8 w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl transition-all font-semibold text-sm border border-slate-700">
+            重設 (Reset)
+        </button>
+    </div>
+
+    <div id="canvas-container" class="w-full h-screen"></div>
+
+    <script>
+        let scene, camera, renderer, objectGroup, staticAxes;
+        const sliders = { 
+            roll: document.getElementById('roll'), 
+            pitch: document.getElementById('pitch'), 
+            yaw: document.getElementById('yaw') 
+        };
+        const displays = { 
+            roll: document.getElementById('val-roll'), 
+            pitch: document.getElementById('val-pitch'), 
+            yaw: document.getElementById('val-yaw') 
+        };
+        const matrixContainer = document.getElementById('matrix-display');
+        const warning = document.getElementById('gimbal-warning');
+
+        function createTextLabel(text, color) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128; canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            ctx.font = 'bold 70px Inter, sans-serif';
+            ctx.fillStyle = color;
+            ctx.textAlign = 'center';
+            ctx.fillText(text, 64, 90);
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.scale.set(0.6, 0.6, 1);
+            return sprite;
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(5, 4, 7);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+            const spotLight = new THREE.SpotLight(0xffffff, 1);
+            spotLight.position.set(10, 10, 10);
+            scene.add(spotLight);
+
+            // 1. 初始參考軸 (灰透明，固定不動)
+            staticAxes = new THREE.Group();
+            const createStaticAxis = (dir, label) => {
+                const mat = new THREE.LineBasicMaterial({ 
+                    color: 0x64748b, 
+                    transparent: true, 
+                    opacity: 0.3 
+                });
+                const pts = [new THREE.Vector3(0,0,0), dir.clone().multiplyScalar(4.5)];
+                const geo = new THREE.BufferGeometry().setFromPoints(pts);
+                staticAxes.add(new THREE.Line(geo, mat));
+                const l = createTextLabel(label, '#64748b');
+                l.position.copy(dir).multiplyScalar(4.8);
+                staticAxes.add(l);
+            };
+            createStaticAxis(new THREE.Vector3(1,0,0), 'X0');
+            createStaticAxis(new THREE.Vector3(0,1,0), 'Y0');
+            createStaticAxis(new THREE.Vector3(0,0,1), 'Z0');
+            scene.add(staticAxes);
+
+            // 2. 動態軸 (隨旋轉變動)
+            objectGroup = new THREE.Group();
+            const createAxis = (dir, color, label) => {
+                const mat = new THREE.LineBasicMaterial({ color: color, linewidth: 2 });
+                const pts = [new THREE.Vector3(0,0,0), dir.clone().multiplyScalar(3.5)];
+                const geo = new THREE.BufferGeometry().setFromPoints(pts);
+                const line = new THREE.Line(geo, mat);
+                objectGroup.add(line);
+                const l = createTextLabel(label, color);
+                l.position.copy(dir).multiplyScalar(3.8);
+                objectGroup.add(l);
+            };
+            createAxis(new THREE.Vector3(1,0,0), '#ef4444', 'X');
+            createAxis(new THREE.Vector3(0,1,0), '#22c55e', 'Y');
+            createAxis(new THREE.Vector3(0,0,1), '#3b82f6', 'Z');
+            scene.add(objectGroup);
+
+            // 輔助地面
+            scene.add(new THREE.GridHelper(20, 20, 0x1e293b, 0x0f172a));
+
+            // 控制器事件
+            Object.values(sliders).forEach(s => s.addEventListener('input', update));
+            document.getElementById('reset').onclick = () => {
+                sliders.roll.value = 0; sliders.pitch.value = 0; sliders.yaw.value = 0;
+                update();
+            };
+
+            window.addEventListener('resize', onWindowResize);
+            update();
+            animate();
+        }
+
+        function update() {
+            const r = THREE.MathUtils.degToRad(parseFloat(sliders.roll.value));
+            const p = THREE.MathUtils.degToRad(parseFloat(sliders.pitch.value));
+            const y = THREE.MathUtils.degToRad(parseFloat(sliders.yaw.value));
+
+            displays.roll.innerText = sliders.roll.value;
+            displays.pitch.innerText = sliders.pitch.value;
+            displays.yaw.innerText = sliders.yaw.value;
+
+            // 歐拉旋轉 (Z-Y-X 對應內旋 XYZ)
+            objectGroup.rotation.set(r, p, y, 'XYZ');
+
+            // 死鎖警示 (Pitch 接近 90 度)
+            if (Math.abs(parseFloat(sliders.pitch.value)) >= 89) {
+                warning.classList.remove('hidden');
+            } else {
+                warning.classList.add('hidden');
+            }
+
+            updateMatrixDisplay();
+        }
+
+        function updateMatrixDisplay() {
+            objectGroup.updateMatrixWorld();
+            const m = objectGroup.matrix.elements;
+            matrixContainer.innerHTML = '';
+            for (let i = 0; i < 3; i++) {
+                for (let j = 0; j < 3; j++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'matrix-cell';
+                    cell.innerText = m[j * 4 + i].toFixed(2);
+                    matrixContainer.appendChild(cell);
+                }
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            // 場景微幅自轉增加 3D 立體感
+            scene.rotation.y += 0.001;
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
